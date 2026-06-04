@@ -8,10 +8,17 @@ CORS(app)
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
-        # Accept both binary and base64 JSON
+        # Accept gzip binary, plain binary, or base64 JSON
         content_type = request.content_type or ''
+        content_encoding = request.headers.get('Content-Encoding','')
+        
         if 'octet-stream' in content_type:
-            pdf_bytes = request.data
+            raw = request.data
+            if 'gzip' in content_encoding:
+                import gzip
+                pdf_bytes = gzip.decompress(raw)
+            else:
+                pdf_bytes = raw
         else:
             data = request.json
             if not data or 'pdf' not in data:
