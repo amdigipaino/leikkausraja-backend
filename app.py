@@ -150,10 +150,9 @@ def analyze():
         result = []
         for key, g in groups.items():
             if g['paths']:
-                # Filter out tiny paths and very large (full-page) paths
+                # Only filter truly tiny paths (< 2mm)
                 filtered = [p for p in g['paths'] if p['bbox'] and
-                           (p['bbox']['w'] > 2 or p['bbox']['h'] > 2) and
-                           not (p['bbox']['w'] > page_w_mm * 0.9 and p['bbox']['h'] > page_h_mm * 0.9)]
+                           (p['bbox']['w'] > 2 or p['bbox']['h'] > 2)]
                 if filtered:
                     result.append({'key': key, 'name': g['name'], 'paths': filtered})
 
