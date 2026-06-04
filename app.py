@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import pdfplumber
-import io, base64
+import pdfplumber, pypdf, io, base64
 
 app = Flask(__name__)
 CORS(app)
@@ -14,133 +13,160 @@ def analyze():
             return jsonify({'error': 'No PDF data'}), 400
 
         pdf_bytes = base64.b64decode(data['pdf'])
-        
+
+        # Get page size
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             page = pdf.pages[0]
-            page_w_mm = page.width / 2.8346
-            page_h_mm = page.height / 2.8346
-
-            # Get colorspace names from PDF resources
-            cs_names = {}
-            try:
-                import pypdf
-                reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-                res = reader.pages[0].get('/Resources', {})
-                if hasattr(res, 'get_object'): res = res.get_object()
-                cs_res = res.get('/ColorSpace', {})
-                if hasattr(cs_res, 'get_object'): cs_res = cs_res.get_object()
-                for k, v in cs_res.items():
-                    obj = v.get_object() if hasattr(v, 'get_object') else v
-                    if isinstance(obj, list) and len(obj) > 1:
-                        cs_names[k] = str(obj[1]).strip('/')
-            except Exception as e:
-                pass
-
-            # Parse PDF stream for colored paths
-            import pypdf as pypdf2
-            reader2 = pypdf2.PdfReader(io.BytesIO(pdf_bytes))
-            pg = reader2.pages[0]
-            content = pg.get('/Contents')
-            if hasattr(content, '__iter__') and not hasattr(content, 'get_data'):
-                streams = [c.get_object() for c in content]
-            else:
-                streams = [content.get_object()]
-            
-            full = b''.join(s.get_data() for s in streams if hasattr(s, 'get_data'))
-            text = full.decode('latin-1', errors='replace')
-            lines = text.split('\n')
-
+            page_w_mm = round(page.width / 2.8346, 3)
+            page_h_mm = round(page.height / 2.8346, 3)
             page_h_pt = page.height
-            cur_cs = 'default'
-            cur_lw = 1.0
-            pts = []
-            groups = {}
 
-            def flush():
-                if len(pts) < 2:
-                    pts.clear()
-                    return
-                key = cur_cs
-                name = cs_names.get(cur_cs, cur_cs)
-                if key not in groups:
-                    groups[key] = {'name': name, 'paths': []}
-                x0 = min(p[0] for p in pts)
-                y0 = min(p[1] for p in pts)
-                x1 = max(p[0] for p in pts)
-                y1 = max(p[1] for p in pts)
-                w = x1 - x0
-                h = y1 - y0
-                if w > 1 or h > 1:
-                    groups[key]['paths'].append({
-                        'x': round(x0 / 2.8346, 3),
-                        'y': round(y0 / 2.8346, 3),
-                        'w': round(w / 2.8346, 3),
-                        'h': round(h / 2.8346, 3),
-                        'lw': round(cur_lw, 3)
-                    })
-                pts.clear()
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        pg = reader.pages[0]
 
-            for raw_line in lines:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if not parts:
-                    continue
-                cmd = parts[-1]
-                args = parts[:-1]
+        # Get colorspace names
+        cs_names = {}
+        try:
+            res = pg.get('/Resources', {})
+            if hasattr(res, 'get_object'): res = res.get_object()
+            cs_res = res.get('/ColorSpace', {})
+            if hasattr(cs_res, 'get_object'): cs_res = cs_res.get_object()
+            for k, v in cs_res.items():
+                obj = v.get_object() if hasattr(v, 'get_object') else v
+                if isinstance(obj, list) and len(obj) > 1:
+                    cs_names[k] = str(obj[1]).strip('/')
+        except: pass
 
-                if cmd == 'w' and args:
-                    try: cur_lw = float(args[0])
-                    except: pass
-                elif cmd == 'CS' and args:
-                    flush()
-                    cur_cs = args[0]
-                elif cmd == 're' and len(args) >= 4:
-                    flush()
+        # Parse content stream
+        content_obj = pg.get('/Contents')
+        if hasattr(content_obj, '__iter__') and not hasattr(content_obj, 'get_data'):
+            streams = [c.get_object() for c in content_obj]
+        else:
+            streams = [content_obj.get_object()]
+        full = b''.join(s.get_data() for s in streams if hasattr(s, 'get_data'))
+        text = full.decode('latin-1', errors='replace')
+        lines_list = text.split('\n')
+
+        cur_cs = 'default'
+        cur_lw = 1.0
+        cur_seg = []
+        groups = {}
+
+        def flush(cmd):
+            if not cur_seg:
+                return
+            key = cur_cs
+            name = cs_names.get(cur_cs, cur_cs)
+            if key not in groups:
+                groups[key] = {'name': name, 'paths': []}
+
+            # Convert path segment to serializable format
+            path_ops = []
+            is_rect = len(cur_seg) == 1 and cur_seg[0][0] == 're'
+
+            if is_rect:
+                try:
+                    x, y, w, h = [float(v) for v in cur_seg[0][1][:4]]
+                    # Convert PDF coords (bottom-up) to top-down
+                    path_ops = [{'op': 're', 'args': [
+                        round(x / 2.8346, 3),
+                        round((page_h_pt - y - h) / 2.8346, 3),
+                        round(w / 2.8346, 3),
+                        round(abs(h) / 2.8346, 3)
+                    ]}]
+                except:
+                    pass
+            else:
+                # Full path with curves
+                for op, args in cur_seg:
+                    converted = []
                     try:
-                        x, y, w, h = float(args[0]), float(args[1]), float(args[2]), float(args[3])
-                        # PDF y is from bottom, convert to top-down
-                        pts[:] = [
-                            [x, page_h_pt - y - h],
-                            [x + w, page_h_pt - y - h],
-                            [x + w, page_h_pt - y],
-                            [x, page_h_pt - y]
-                        ]
-                    except: pass
-                elif cmd == 'm' and len(args) >= 2:
-                    flush()
-                    try: pts[:] = [[float(args[0]), page_h_pt - float(args[1])]]
-                    except: pass
-                elif cmd == 'l' and len(args) >= 2:
-                    try: pts.append([float(args[0]), page_h_pt - float(args[1])])
-                    except: pass
-                elif cmd in ('S', 's'):
-                    flush()
-                elif cmd in ('n', 'Q'):
-                    pts.clear()
+                        vals = [float(v) for v in args]
+                        # Convert y coords (every 2nd value starting from index 1)
+                        if op in ('m', 'l'):
+                            converted = [round(vals[0]/2.8346,3), round((page_h_pt-vals[1])/2.8346,3)]
+                        elif op in ('c',):
+                            # 6 args: x1,y1,x2,y2,x,y
+                            converted = [
+                                round(vals[0]/2.8346,3), round((page_h_pt-vals[1])/2.8346,3),
+                                round(vals[2]/2.8346,3), round((page_h_pt-vals[3])/2.8346,3),
+                                round(vals[4]/2.8346,3), round((page_h_pt-vals[5])/2.8346,3),
+                            ]
+                        elif op in ('v', 'y'):
+                            converted = [round(v/2.8346,3) if i%2==0 else round((page_h_pt-v)/2.8346,3) for i,v in enumerate(vals)]
+                        elif op == 'h':
+                            converted = []
+                    except:
+                        pass
+                    path_ops.append({'op': op, 'args': converted})
 
-            flush()
+            if path_ops:
+                # Compute bounding box
+                xs, ys = [], []
+                for po in path_ops:
+                    a = po['args']
+                    if po['op'] == 're':
+                        xs += [a[0], a[0]+a[2]]
+                        ys += [a[1], a[1]+a[3]]
+                    elif po['op'] in ('m','l'):
+                        xs.append(a[0]); ys.append(a[1])
+                    elif po['op'] == 'c':
+                        xs += [a[0],a[2],a[4]]; ys += [a[1],a[3],a[5]]
 
-            result = []
-            for key, g in groups.items():
-                if g['paths']:
-                    result.append({
-                        'key': key,
-                        'name': g['name'],
-                        'paths': g['paths']
-                    })
+                bbox = None
+                if xs and ys:
+                    bbox = {
+                        'x': round(min(xs),3), 'y': round(min(ys),3),
+                        'w': round(max(xs)-min(xs),3), 'h': round(max(ys)-min(ys),3)
+                    }
 
-            return jsonify({
-                'pageW': round(page_w_mm, 2),
-                'pageH': round(page_h_mm, 2),
-                'csNames': cs_names,
-                'groups': result
-            })
+                groups[key]['paths'].append({
+                    'ops': path_ops,
+                    'bbox': bbox,
+                    'lw': round(cur_lw / 2.8346, 3),
+                    'isRect': is_rect,
+                    'isCurve': any(po['op'] == 'c' for po in path_ops)
+                })
+
+            cur_seg.clear()
+
+        for line in lines_list:
+            parts = line.strip().split()
+            if not parts: continue
+            cmd = parts[-1]; args = parts[:-1]
+            if cmd == 'w' and args:
+                try: cur_lw = float(args[0])
+                except: pass
+            elif cmd == 'CS' and args:
+                flush(cmd); cur_cs = args[0]
+            elif cmd in {'m','l','c','v','y','h','re'}:
+                cur_seg.append((cmd, args))
+            elif cmd in {'S','s','B','b','f','F','SCN','SC'}:
+                flush(cmd)
+            elif cmd in {'n','Q'}:
+                cur_seg.clear()
+        flush('end')
+
+        result = []
+        for key, g in groups.items():
+            if g['paths']:
+                # Filter out tiny paths and very large (full-page) paths
+                filtered = [p for p in g['paths'] if p['bbox'] and
+                           (p['bbox']['w'] > 2 or p['bbox']['h'] > 2) and
+                           not (p['bbox']['w'] > page_w_mm * 0.9 and p['bbox']['h'] > page_h_mm * 0.9)]
+                if filtered:
+                    result.append({'key': key, 'name': g['name'], 'paths': filtered})
+
+        return jsonify({
+            'pageW': page_w_mm,
+            'pageH': page_h_mm,
+            'csNames': cs_names,
+            'groups': result
+        })
 
     except Exception as e:
         import traceback
-        return jsonify({'error': str(e), 'trace': traceback.format_exc()[-500:]}), 500
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()[-800:]}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
