@@ -226,7 +226,17 @@ def analyze():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'version': '3.0-ctm'})
+
+@app.route('/debug', methods=['GET'])
+def debug():
+    import sys
+    return jsonify({
+        'version': '3.0-ctm',
+        'python': sys.version,
+        'has_ctm': True,
+        'features': ['cm-transform', 'bezier-curves', 'spot-colors']
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
