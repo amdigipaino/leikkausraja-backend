@@ -8,11 +8,18 @@ CORS(app)
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
-        data = request.json
-        if not data or 'pdf' not in data:
-            return jsonify({'error': 'No PDF data'}), 400
-
-        pdf_bytes = base64.b64decode(data['pdf'])
+        # Accept both binary and base64 JSON
+        content_type = request.content_type or ''
+        if 'octet-stream' in content_type:
+            pdf_bytes = request.data
+        else:
+            data = request.json
+            if not data or 'pdf' not in data:
+                return jsonify({'error': 'No PDF data'}), 400
+            pdf_bytes = base64.b64decode(data['pdf'])
+        
+        if not pdf_bytes:
+            return jsonify({'error': 'Empty PDF data'}), 400
 
         # Get page size
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
